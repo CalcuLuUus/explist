@@ -1,0 +1,19 @@
+{
+  "name": "gpu-task-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 1895",
+    "build": "vite build",
+    "preview": "vite preview --port 1895"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "vue": "^3.4.21"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.4",
+    "vite": "^5.2.0"
+  }
+}
