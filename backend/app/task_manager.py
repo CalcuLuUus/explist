@@ -248,9 +248,18 @@ class TaskManager:
         log_path = task_dir / "tmux.log"
         exit_code_path = task_dir / "exit_code"
         script_path = task_dir / "run.sh"
+        command_script_path = task_dir / "command.sh"
 
         assigned_str = ",".join(str(idx) for idx in assigned_gpus)
         command = row["command"]
+
+        command_script_lines = [
+            "#!/usr/bin/env bash",
+            "set -uo pipefail",
+            command,
+        ]
+        command_script_path.write_text("\n".join(command_script_lines) + "\n", encoding="utf-8")
+        os.chmod(command_script_path, 0o750)
 
         script_lines = [
             "#!/usr/bin/env bash",
@@ -259,8 +268,11 @@ class TaskManager:
         if assigned_str:
             script_lines.append(f"export CUDA_VISIBLE_DEVICES={assigned_str}")
         script_lines.append(f"cd {shlex.quote(str(self.workdir))}")
-        script_lines.append(command)
-        script_lines.append("exit_code=$?")
+        script_lines.append(f'COMMAND_SCRIPT={shlex.quote(str(command_script_path))}')
+        script_lines.append(f'LOG_FILE={shlex.quote(str(log_path))}')
+        script_lines.append('mkdir -p "$(dirname "$LOG_FILE")"')
+        script_lines.append('"$COMMAND_SCRIPT" 2>&1 | tee -a "$LOG_FILE"')
+        script_lines.append('exit_code=${PIPESTATUS[0]}')
         script_lines.append(f"echo $exit_code > \"{exit_code_path}\"")
         script_lines.append("exit $exit_code")
 
@@ -281,15 +293,6 @@ class TaskManager:
         ]
         try:
             run(launch_cmd, check=True)
-            pipe_cmd = [
-                "tmux",
-                "pipe-pane",
-                "-t",
-                session_name,
-                "-o",
-                f"cat >> {shlex.quote(str(log_path))}",
-            ]
-            run(pipe_cmd, check=True)
         except CalledProcessError as exc:
             raise RuntimeError(f"tmux command failed: {exc}") from exc
 
