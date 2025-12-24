@@ -400,6 +400,7 @@ class TaskManager:
         script_lines.append(f'COMMAND_SCRIPT={shlex.quote(str(command_script_path))}')
         script_lines.append(f'LOG_FILE={shlex.quote(str(log_path))}')
         script_lines.append("export LOG_FILE")
+        script_lines.append('export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"')
         script_lines.append('mkdir -p "$(dirname "$LOG_FILE")"')
         script_lines.append('echo "===== Scheduler Environment =====" >> "$LOG_FILE"')
         script_lines.append('echo "Timestamp: $(date -Is)" >> "$LOG_FILE"')

@@ -36,8 +36,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # 默认监听 8000，可以根据需要调整
-# 若机器安装了 Conda，会自动尝试检测 ~/miniconda3 等路径。
-# 也可通过 `CONDA_INIT_SCRIPT=/path/to/conda.sh` 明确指定初始化脚本。
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -84,9 +82,10 @@ npm run dev
 
 ### bug
 
-- [ ] GPU状态读取
+- [x] GPU状态读取
 
 ### feature
 
-- [ ] 列表刷新
-- [ ] 停止任务
+- [x] 列表刷新
+- [x] 停止任务
+- [ ] 多卡适配
