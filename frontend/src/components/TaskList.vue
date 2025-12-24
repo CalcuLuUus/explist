@@ -78,6 +78,8 @@ const statusClass = (status) => {
       return 'status-completed';
     case 'failed':
       return 'status-failed';
+    case 'cancelled':
+      return 'status-cancelled';
     default:
       return '';
   }
@@ -93,6 +95,8 @@ const statusLabel = (status) => {
       return '已完成';
     case 'failed':
       return '失败';
+    case 'cancelled':
+      return '已中断';
     default:
       return status;
   }

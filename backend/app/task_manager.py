@@ -4,7 +4,9 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import sqlite3
+import sys
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -15,7 +17,15 @@ from typing import Deque, Dict, List, Optional
 from subprocess import CalledProcessError, run
 
 from .gpu_monitor import GPUQueryError, GPUState, query_gpu_states
-from .schemas import GPUInfo, TaskCreate, TaskDetail, TaskLogResponse, TaskStatus, TaskSummary
+from .schemas import (
+    GPUInfo,
+    GPUProcessInfo,
+    TaskCreate,
+    TaskDetail,
+    TaskLogResponse,
+    TaskStatus,
+    TaskSummary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +42,29 @@ class RunningTask:
 
 
 class TaskManager:
-    def __init__(self, db_path: Path, runtime_dir: Path, poll_interval: float = 2.0) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        runtime_dir: Path,
+        poll_interval: float = 2.0,
+        *,
+        conda_activate_script: Optional[Path] = None,
+    ) -> None:
         self.db_path = Path(db_path)
         self.runtime_dir = Path(runtime_dir)
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.poll_interval = poll_interval
         self.workdir = Path.cwd()
+        if conda_activate_script:
+            self.conda_activate_script = Path(conda_activate_script).expanduser().resolve()
+        else:
+            self.conda_activate_script = self._auto_detect_conda_script()
+        if Path("/usr/bin/python3").exists():
+            self._system_python = "/usr/bin/python3"
+        elif Path("/usr/bin/python").exists():
+            self._system_python = "/usr/bin/python"
+        else:
+            self._system_python = sys.executable
 
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -81,12 +108,19 @@ class TaskManager:
         if payload.gpu_type not in available_types:
             raise ValueError(f"GPU type '{payload.gpu_type}' not detected on this host")
 
+        if payload.conda_env:
+            if not self._can_activate_conda(payload.conda_env):
+                raise ValueError(
+                    "Requested conda environment cannot be activated: provide an absolute path "
+                    "or configure CONDA_INIT_SCRIPT"
+                )
+
         now = self._utc_now()
         with self._db_lock:
             cursor = self._conn.execute(
                 """
-                INSERT INTO tasks (name, gpu_type, gpu_count, command, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (name, gpu_type, gpu_count, command, status, created_at, conda_env)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload.name,
@@ -95,6 +129,7 @@ class TaskManager:
                     payload.command,
                     TaskStatus.QUEUED.value,
                     now.isoformat(),
+                    payload.conda_env,
                 ),
             )
             task_id = int(cursor.lastrowid)
@@ -119,7 +154,7 @@ class TaskManager:
         row = self._fetch_one(
             """
             SELECT id, name, status, gpu_type, gpu_count, command, created_at, started_at,
-                   completed_at, tmux_session, assigned_gpus, log_path, exit_code, error
+                   completed_at, tmux_session, assigned_gpus, log_path, exit_code, error, conda_env
             FROM tasks
             WHERE id = ?
             """,
@@ -129,25 +164,99 @@ class TaskManager:
             raise KeyError(f"Task {task_id} not found")
         return self._row_to_detail(row)
 
+    def cancel_task(self, task_id: int) -> TaskDetail:
+        row = self._fetch_one(
+            """
+            SELECT id, status, tmux_session
+            FROM tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
+        if row is None:
+            raise KeyError(f"Task {task_id} not found")
+        status = TaskStatus(row["status"])
+        if status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+            raise ValueError("Only queued or running tasks can be cancelled")
+
+        if status == TaskStatus.QUEUED:
+            with self._state_lock:
+                self._remove_from_queue(task_id)
+            self._update_task_completion(
+                task_id,
+                TaskStatus.CANCELLED,
+                exit_code=None,
+                error="Task cancelled before start",
+            )
+            return self.get_task(task_id)
+
+        session = row["tmux_session"]
+        if session:
+            self._kill_tmux_session(session)
+        with self._state_lock:
+            self._running.pop(task_id, None)
+        self._update_task_completion(
+            task_id,
+            TaskStatus.CANCELLED,
+            exit_code=None,
+            error="Task cancelled by user",
+        )
+        return self.get_task(task_id)
+
     def get_gpu_status(self) -> List[GPUInfo]:
         gpu_states = self._safe_query_gpu_states()
         assigned_lookup: Dict[int, int] = {}
+
+        rows = self._fetch_rows(
+            """
+            SELECT id, assigned_gpus
+            FROM tasks
+            WHERE status = ? AND assigned_gpus IS NOT NULL
+            """,
+            (TaskStatus.RUNNING.value,),
+        )
+        for row in rows:
+            try:
+                assigned = json.loads(row["assigned_gpus"] or "[]")
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse assigned GPUs for task %s", row["id"])
+                continue
+            for gpu_idx in assigned:
+                try:
+                    assigned_lookup[int(gpu_idx)] = int(row["id"])
+                except (TypeError, ValueError):
+                    logger.debug(
+                        "Ignoring invalid GPU index %s for task %s", gpu_idx, row["id"]
+                    )
+
         with self._state_lock:
             for rt in self._running.values():
                 for gpu_idx in rt.assigned_gpus:
-                    assigned_lookup[gpu_idx] = rt.task_id
+                    assigned_lookup.setdefault(gpu_idx, rt.task_id)
         infos: List[GPUInfo] = []
         for state in gpu_states:
+            process_infos = [
+                GPUProcessInfo(
+                    pid=proc.pid,
+                    name=proc.name,
+                    username=proc.username,
+                    used_memory=proc.used_memory,
+                )
+                for proc in state.processes
+            ]
+            assigned_task = assigned_lookup.get(state.index)
             infos.append(
                 GPUInfo(
                     index=state.index,
+                    uuid=state.uuid,
                     name=state.name,
                     memory_total=state.memory_total,
                     memory_used=state.memory_used,
                     utilization_gpu=state.utilization_gpu,
                     utilization_mem=state.utilization_mem,
-                    assigned_task_id=assigned_lookup.get(state.index),
-                    is_free=state.index not in assigned_lookup,
+                    assigned_task_id=assigned_task,
+                    processes=process_infos,
+                    is_free=assigned_task is None and not process_infos,
                 )
             )
         return infos
@@ -198,6 +307,9 @@ class TaskManager:
         for state in gpu_states:
             if state.index in assigned_indices:
                 continue
+            if state.processes:
+                # Skip GPUs that already have active compute processes outside the scheduler
+                continue
             available_by_type.setdefault(state.name, []).append(state)
 
         launched_any = True
@@ -206,7 +318,7 @@ class TaskManager:
             task_id = self._queue[0]
             row = self._fetch_one(
                 """
-                SELECT id, name, status, gpu_type, gpu_count, command
+                SELECT id, name, status, gpu_type, gpu_count, command, conda_env
                 FROM tasks
                 WHERE id = ?
                 """,
@@ -248,19 +360,62 @@ class TaskManager:
         log_path = task_dir / "tmux.log"
         exit_code_path = task_dir / "exit_code"
         script_path = task_dir / "run.sh"
+        command_script_path = task_dir / "command.sh"
 
         assigned_str = ",".join(str(idx) for idx in assigned_gpus)
         command = row["command"]
+        conda_env = row["conda_env"]
 
+        command_script_lines = [
+            "#!/usr/bin/env bash",
+            "set -eo pipefail",
+            'if [ -n "${LOG_FILE:-}" ]; then',
+            '  echo "===== Command Script Start =====" >> "$LOG_FILE"',
+            '  echo "Script PATH: $PATH" >> "$LOG_FILE"',
+            '  echo -n "command -v python: " >> "$LOG_FILE"',
+            '  command -v python >> "$LOG_FILE" 2>&1 || true',
+            '  echo -n "command -v conda: " >> "$LOG_FILE"',
+            '  command -v conda >> "$LOG_FILE" 2>&1 || true',
+            "fi",
+            'trap \'if [ -n "${LOG_FILE:-}" ]; then echo "===== Command Script Exit =====" >> "$LOG_FILE"; echo "PATH: $PATH" >> "$LOG_FILE"; echo -n "python -> " >> "$LOG_FILE"; command -v python >> "$LOG_FILE" 2>&1 || true; fi\' EXIT',
+            command,
+        ]
+        command_script_path.write_text("\n".join(command_script_lines) + "\n", encoding="utf-8")
+        os.chmod(command_script_path, 0o750)
+
+        venv_bin = self.workdir / ".venv" / "bin"
         script_lines = [
             "#!/usr/bin/env bash",
-            "set -uo pipefail",
+            "set -eo pipefail",
+            f'VENV_BIN={shlex.quote(str(venv_bin))}',
+            f'SYSTEM_PYTHON={shlex.quote(self._system_python)}',
+            "export VENV_BIN",
+            "export SYSTEM_PYTHON",
+            'PATH=$("$SYSTEM_PYTHON" - <<\'PY\'\nimport os\nvenv = os.environ.get("VENV_BIN")\npath = os.environ.get("PATH", "")\nparts = [p for p in path.split(":") if p and p != venv]\nprint(":".join(parts))\nPY\n)',
+            "export PATH",
         ]
         if assigned_str:
             script_lines.append(f"export CUDA_VISIBLE_DEVICES={assigned_str}")
         script_lines.append(f"cd {shlex.quote(str(self.workdir))}")
-        script_lines.append(command)
-        script_lines.append("exit_code=$?")
+        script_lines.append(f'COMMAND_SCRIPT={shlex.quote(str(command_script_path))}')
+        script_lines.append(f'LOG_FILE={shlex.quote(str(log_path))}')
+        script_lines.append("export LOG_FILE")
+        script_lines.append('export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"')
+        script_lines.append('mkdir -p "$(dirname "$LOG_FILE")"')
+        script_lines.append('echo "===== Scheduler Environment =====" >> "$LOG_FILE"')
+        script_lines.append('echo "Timestamp: $(date -Is)" >> "$LOG_FILE"')
+        script_lines.append('echo "User: $(whoami)" >> "$LOG_FILE"')
+        script_lines.append('echo "Shell: ${SHELL:-unknown}" >> "$LOG_FILE"')
+        script_lines.append('echo "Bash version: ${BASH_VERSION:-n/a}" >> "$LOG_FILE"')
+        script_lines.append('echo "Working dir: $(pwd)" >> "$LOG_FILE"')
+        script_lines.append('echo "PATH: $PATH" >> "$LOG_FILE"')
+        script_lines.append('echo -n "Python on PATH: " >> "$LOG_FILE"')
+        script_lines.append('command -v python >> "$LOG_FILE" 2>&1 || true')
+        script_lines.append('echo "----------------------------------" >> "$LOG_FILE"')
+        if conda_env:
+            script_lines.extend(self._conda_activation_lines(conda_env))
+        script_lines.append('bash "$COMMAND_SCRIPT" 2>&1 | tee -a "$LOG_FILE"')
+        script_lines.append('exit_code=${PIPESTATUS[0]}')
         script_lines.append(f"echo $exit_code > \"{exit_code_path}\"")
         script_lines.append("exit $exit_code")
 
@@ -281,15 +436,6 @@ class TaskManager:
         ]
         try:
             run(launch_cmd, check=True)
-            pipe_cmd = [
-                "tmux",
-                "pipe-pane",
-                "-t",
-                session_name,
-                "-o",
-                f"cat >> {shlex.quote(str(log_path))}",
-            ]
-            run(pipe_cmd, check=True)
         except CalledProcessError as exc:
             raise RuntimeError(f"tmux command failed: {exc}") from exc
 
@@ -351,6 +497,13 @@ class TaskManager:
 
         for task_id in completed:
             self._running.pop(task_id, None)
+
+    def _remove_from_queue(self, task_id: int) -> bool:
+        try:
+            self._queue.remove(task_id)
+            return True
+        except ValueError:
+            return False
 
     def _update_task_status(
         self,
@@ -414,11 +567,20 @@ class TaskManager:
                     assigned_gpus TEXT,
                     log_path TEXT,
                     exit_code INTEGER,
-                    error TEXT
+                    error TEXT,
+                    conda_env TEXT
                 )
                 """
             )
             self._conn.commit()
+
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            if "conda_env" not in columns:
+                self._conn.execute("ALTER TABLE tasks ADD COLUMN conda_env TEXT")
+                self._conn.commit()
 
     def _load_initial_state(self) -> None:
         rows = self._fetch_rows(
@@ -499,6 +661,7 @@ class TaskManager:
             log_path=row["log_path"],
             exit_code=row["exit_code"],
             error=row["error"],
+            conda_env=row["conda_env"],
         )
 
     def _tmux_has_session(self, session_name: str) -> bool:
@@ -536,9 +699,64 @@ class TaskManager:
         if result.returncode != 0:
             raise RuntimeError("tmux is required but not available on this system")
 
+    def _kill_tmux_session(self, session_name: str) -> None:
+        result = run(
+            ["tmux", "has-session", "-t", session_name],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            return
+        run(["tmux", "kill-session", "-t", session_name], capture_output=True)
+
     def _safe_query_gpu_states(self) -> List[GPUState]:
         try:
             return query_gpu_states()
         except GPUQueryError as exc:
             logger.warning("GPU query failed: %s", exc)
             return []
+
+    def _auto_detect_conda_script(self) -> Optional[Path]:
+        candidates = []
+        conda_exe = os.environ.get("CONDA_EXE") or shutil.which("conda")
+        if conda_exe:
+            base = Path(conda_exe).resolve().parent.parent
+            candidates.append(base / "etc/profile.d/conda.sh")
+        home = Path.home()
+        candidates.append(home / "miniconda3" / "etc" / "profile.d" / "conda.sh")
+        candidates.append(home / "anaconda3" / "etc" / "profile.d" / "conda.sh")
+        for candidate in candidates:
+            if candidate and candidate.exists():
+                logger.info("Auto-detected conda init script at %s", candidate)
+                return candidate
+        logger.info("No conda init script detected; conda_env must be an absolute path")
+        return None
+
+    def _conda_activation_lines(self, conda_env: str) -> List[str]:
+        lines: List[str] = []
+        if not conda_env:
+            return lines
+        if self.conda_activate_script and self.conda_activate_script.exists():
+            lines.append(f"source {shlex.quote(str(self.conda_activate_script))}")
+            lines.append(f"conda activate {shlex.quote(conda_env)}")
+            return lines
+
+        env_path = Path(conda_env)
+        if env_path.is_absolute():
+            bin_path = env_path / "bin"
+            lines.append(f'export CONDA_PREFIX={shlex.quote(str(env_path))}')
+            lines.append(f'export PATH={shlex.quote(str(bin_path))}:"$PATH"')
+            lines.append('export CONDA_DEFAULT_ENV="${CONDA_DEFAULT_ENV:-$(basename "$CONDA_PREFIX")}"')
+            return lines
+
+        raise RuntimeError(
+            "Conda activation requested but scheduler was not configured with CONDA_INIT_SCRIPT "
+            "and the provided value is not an absolute environment path"
+        )
+
+    def _can_activate_conda(self, conda_env: str) -> bool:
+        if not conda_env:
+            return True
+        if self.conda_activate_script and self.conda_activate_script.exists():
+            return True
+        env_path = Path(conda_env)
+        return env_path.is_absolute()

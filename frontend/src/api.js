@@ -31,3 +31,8 @@ export async function createTask(payload) {
   const { data } = await client.post('/tasks', payload);
   return data;
 }
+
+export async function cancelTask(taskId) {
+  const { data } = await client.post(`/tasks/${taskId}/cancel`);
+  return data;
+}

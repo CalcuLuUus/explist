@@ -2,15 +2,35 @@
   <div>
     <div class="card">
       <div class="section-title">
-        <h2>任务详情 · #{{ task?.id ?? taskId }}</h2>
         <div>
+          <h2>任务详情 · #{{ task?.id ?? taskId }}</h2>
+          <div v-if="detailRefreshing" class="muted">数据刷新中…</div>
+        </div>
+        <div class="detail-actions">
           <button class="btn secondary" type="button" @click="$emit('back')">返回列表</button>
+          <button
+            class="btn"
+            type="button"
+            @click="cloneTask"
+            :disabled="!task"
+          >
+            复制任务
+          </button>
+          <button
+            v-if="canCancel"
+            class="btn danger"
+            type="button"
+            @click="handleCancel"
+            :disabled="cancelling"
+          >
+            {{ cancelling ? '中断中…' : '中断任务' }}
+          </button>
         </div>
       </div>
-      <div v-if="error" class="empty-state">
+      <div v-if="!initialized && loading" class="empty-state">加载中…</div>
+      <div v-else-if="error" class="empty-state">
         {{ error }}
       </div>
-      <div v-else-if="loading" class="empty-state">加载中…</div>
       <div v-else-if="!task" class="empty-state">
         未找到任务信息。
       </div>
@@ -19,6 +39,9 @@
           <div class="stat-card">
             <h3>状态</h3>
             <strong>{{ statusLabel(task.status) }}</strong>
+            <p v-if="cancelError" style="color: #c0262d">
+              <strong>提示：</strong>{{ cancelError }}
+            </p>
           </div>
           <div class="stat-card">
             <h3>GPU 需求</h3>
@@ -73,8 +96,8 @@
 </template>
 
 <script setup>
-import { onBeforeUnmount, ref, watch } from 'vue';
-import { fetchTask, fetchTaskLogs } from '../api';
+import { computed, onBeforeUnmount, ref, watch } from 'vue';
+import { cancelTask, fetchTask, fetchTaskLogs } from '../api';
 
 const props = defineProps({
   taskId: {
@@ -83,15 +106,20 @@ const props = defineProps({
   },
 });
 
-defineEmits(['back']);
+const emit = defineEmits(['back', 'clone']);
 
 const task = ref(null);
 const loading = ref(false);
+const initialized = ref(false);
+const detailRefreshing = ref(false);
 const error = ref('');
 
 const logs = ref([]);
 const logsLoading = ref(false);
 const logsError = ref('');
+
+const cancelling = ref(false);
+const cancelError = ref('');
 
 let detailIntervalId = null;
 let logIntervalId = null;
@@ -106,6 +134,8 @@ const statusLabel = (status) => {
       return '已完成';
     case 'failed':
       return '失败';
+    case 'cancelled':
+      return '已中断';
     default:
       return status;
   }
@@ -118,16 +148,30 @@ const formatDate = (value) => {
   return date.toLocaleString();
 };
 
-const refreshDetail = async () => {
+const canCancel = computed(() => {
+  if (!task.value) return false;
+  return task.value.status === 'queued' || task.value.status === 'running';
+});
+
+const refreshDetail = async ({ initial = false } = {}) => {
   if (!props.taskId) return;
-  loading.value = true;
+  if (!initialized.value || initial) {
+    loading.value = true;
+  } else {
+    detailRefreshing.value = true;
+  }
   error.value = '';
   try {
     task.value = await fetchTask(props.taskId);
+    initialized.value = true;
   } catch (err) {
     error.value = err?.response?.data?.detail ?? err.message ?? '加载任务失败';
   } finally {
-    loading.value = false;
+    if (!initialized.value || initial) {
+      loading.value = false;
+    } else {
+      detailRefreshing.value = false;
+    }
   }
 };
 
@@ -152,19 +196,51 @@ const clearIntervals = () => {
 
 const setupIntervals = () => {
   clearIntervals();
-  detailIntervalId = setInterval(refreshDetail, 5000);
+  detailIntervalId = setInterval(() => refreshDetail(), 5000);
   logIntervalId = setInterval(refreshLogs, 3000);
 };
 
 watch(
   () => props.taskId,
   async () => {
-    await refreshDetail();
+    clearIntervals();
+    task.value = null;
+    logs.value = [];
+    initialized.value = false;
+    await refreshDetail({ initial: true });
     await refreshLogs();
     setupIntervals();
   },
   { immediate: true }
 );
+
+const handleCancel = async () => {
+  if (!canCancel.value || !props.taskId) return;
+  // eslint-disable-next-line no-alert
+  if (typeof window !== 'undefined' && !window.confirm('确定要中断该任务吗？')) {
+    return;
+  }
+  cancelling.value = true;
+  cancelError.value = '';
+  try {
+    const updated = await cancelTask(props.taskId);
+    task.value = updated;
+  } catch (err) {
+    cancelError.value = err?.response?.data?.detail ?? err.message ?? '中断任务失败';
+  } finally {
+    cancelling.value = false;
+  }
+};
+
+const cloneTask = () => {
+  if (!task.value) return;
+  emit('clone', {
+    name: task.value.name,
+    gpu_type: task.value.gpu_type,
+    gpu_count: task.value.gpu_count,
+    command: task.value.command,
+  });
+};
 onBeforeUnmount(clearIntervals);
 </script>
 
@@ -179,5 +255,12 @@ onBeforeUnmount(clearIntervals);
   display: grid;
   gap: 1.5rem;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.detail-actions {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 </style>

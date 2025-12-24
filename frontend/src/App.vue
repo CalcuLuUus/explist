@@ -31,6 +31,7 @@
         v-else-if="currentView === 'taskDetail' && selectedTaskId"
         :task-id="selectedTaskId"
         @back="showTasks"
+        @clone="cloneTask"
       />
       <div v-else-if="currentView === 'taskDetail'" class="card empty-state">
         请选择一个任务查看详情。
@@ -38,6 +39,7 @@
       <NewTaskForm
         v-else-if="currentView === 'newTask'"
         :gpu-options="gpuTypes"
+        :prefill-task="taskPrefill"
         @created="handleTaskCreated"
       />
     </main>
@@ -54,6 +56,7 @@ import NewTaskForm from './components/NewTaskForm.vue';
 
 const currentView = ref('gpus');
 const selectedTaskId = ref(null);
+const taskPrefill = ref(null);
 
 const gpuState = reactive({
   items: [],
@@ -127,6 +130,7 @@ const showTasks = () => {
 };
 
 const showNewTask = () => {
+  taskPrefill.value = null;
   currentView.value = 'newTask';
 };
 
@@ -139,6 +143,16 @@ const handleTaskCreated = (task) => {
   selectedTaskId.value = task.id;
   currentView.value = 'taskDetail';
   refreshTasks();
+};
+
+const cloneTask = (taskData) => {
+  taskPrefill.value = {
+    name: taskData.name,
+    gpu_type: taskData.gpu_type,
+    gpu_count: taskData.gpu_count,
+    command: taskData.command,
+  };
+  currentView.value = 'newTask';
 };
 
 const gpuTypes = computed(() => {
