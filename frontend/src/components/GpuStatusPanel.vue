@@ -27,6 +27,19 @@
           </div>
           <div class="muted">利用率：{{ gpu.utilization_gpu ?? 'N/A' }}%</div>
           <div class="muted">任务：{{ gpu.assigned_task_id ?? '无' }}</div>
+          <div class="muted">
+            <template v-if="gpu.processes?.length">
+              使用者：
+              <span
+                v-for="(proc, index) in gpu.processes"
+                :key="`${gpu.index}-${proc.pid}-${index}`"
+                class="process-pill"
+              >
+                {{ formatProcess(proc) }}
+              </span>
+            </template>
+            <template v-else> 使用者：无 </template>
+          </div>
         </div>
       </div>
     </div>
@@ -61,4 +74,13 @@ const formattedUpdated = computed(() => {
   if (Number.isNaN(date.getTime())) return '';
   return date.toLocaleTimeString();
 });
+
+const formatProcess = (proc) => {
+  if (!proc) return '';
+  const parts = [];
+  if (proc.username) parts.push(proc.username);
+  if (proc.name) parts.push(proc.name);
+  if (proc.pid) parts.push(`#${proc.pid}`);
+  return parts.join(' · ');
+};
 </script>

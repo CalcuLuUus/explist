@@ -62,6 +62,10 @@ const props = defineProps({
     type: Number,
     default: 8,
   },
+  prefillTask: {
+    type: Object,
+    default: null,
+  },
 });
 
 const emit = defineEmits(['created']);
@@ -76,12 +80,28 @@ const form = reactive({
 const submitting = ref(false);
 const error = ref('');
 
+const applyPrefill = (prefill) => {
+  if (!prefill) return;
+  form.name = prefill.name ?? '';
+  if (prefill.gpu_type && props.gpuOptions.includes(prefill.gpu_type)) {
+    form.gpu_type = prefill.gpu_type;
+  } else if (!form.gpu_type) {
+    form.gpu_type = props.gpuOptions[0] ?? '';
+  }
+  form.gpu_count = prefill.gpu_count ?? 1;
+  form.command = prefill.command ?? '';
+};
+
 const resetForm = () => {
+  error.value = '';
+  if (props.prefillTask) {
+    applyPrefill(props.prefillTask);
+    return;
+  }
   form.name = '';
   form.gpu_type = props.gpuOptions[0] ?? '';
   form.gpu_count = 1;
   form.command = '';
-  error.value = '';
 };
 
 watch(
@@ -93,6 +113,16 @@ watch(
     }
     if (!options.includes(form.gpu_type)) {
       form.gpu_type = options[0];
+    }
+  },
+  { immediate: true }
+);
+
+watch(
+  () => props.prefillTask,
+  (prefill) => {
+    if (prefill) {
+      applyPrefill(prefill);
     }
   },
   { immediate: true }

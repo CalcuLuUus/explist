@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import List
 
@@ -32,10 +33,17 @@ def create_app() -> FastAPI:
     )
 
     runtime_root = Path(__file__).resolve().parent.parent / "runtime"
+    conda_activate = os.environ.get("CONDA_INIT_SCRIPT")
+    if conda_activate:
+        conda_activate_path = Path(conda_activate)
+    else:
+        conda_activate_path = None
+
     task_manager = TaskManager(
         db_path=runtime_root / "tasks.db",
         runtime_dir=runtime_root / "tasks",
         poll_interval=2.0,
+        conda_activate_script=conda_activate_path,
     )
 
     def get_manager() -> TaskManager:
@@ -93,8 +101,18 @@ def create_app() -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
 
+    @app.post("/api/tasks/{task_id}/cancel", response_model=TaskDetail, tags=["tasks"])
+    def cancel_task(task_id: int, manager: TaskManager = Depends(get_manager)) -> TaskDetail:
+        try:
+            return manager.cancel_task(task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
     return app
 
 
 app = create_app()
-

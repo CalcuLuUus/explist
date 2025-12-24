@@ -36,6 +36,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # 默认监听 8000，可以根据需要调整
+# 若机器安装了 Conda，会自动尝试检测 ~/miniconda3 等路径。
+# 也可通过 `CONDA_INIT_SCRIPT=/path/to/conda.sh` 明确指定初始化脚本。
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -65,6 +67,7 @@ npm run dev
 - **任务列表**：实时查看队列与历史任务，支持进入详情。
 - **任务详情**：显示命令信息、GPU 分配、退出码，并每 3 秒拉取 tmux 日志的最后 100 行。
 - **新建任务**：填写任务名称、选择 GPU 类型及数量、输入 bash 命令后提交。
+  - 命令输入框支持多行脚本，可直接写 `source /path/to/conda.sh`、`conda activate <env>` 等指令来切换环境，系统会在 tmux shell 中按顺序执行。
 
 ## 运行建议
 
@@ -75,3 +78,15 @@ npm run dev
 
 欢迎根据业务需要扩展功能，例如接入 WebSocket、完善权限与鉴权、支持自定义工作目录等。
 
+--- 
+
+## TODO List
+
+### bug
+
+- [ ] GPU状态读取
+
+### feature
+
+- [ ] 列表刷新
+- [ ] 停止任务
